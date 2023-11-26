@@ -200,7 +200,6 @@ class RunHandle(APIResource[RunId]):
     async def __aiter__(self) -> AsyncGenerator[ActionRequired|StepHandle, Optional[object]]:
         res = await self.retrieve()
         while True:
-            print("Direct:", res.status)
             match res.status:
                 # If it's cancelling, assume it will be cancelled and exit early
                 case "cancelled"|"cancelling":
@@ -248,7 +247,7 @@ class ThreadHandle(APIResource[ThreadId]):
     class MessageEndpoint:
         thread: 'ThreadHandle'
         
-        def __call__(self, message_id):
+        def __call__(self, message_id: MessageId):
             return ThreadMessageHandle(
                 self.thread.openai, message_id, self.thread.id
             )
@@ -269,8 +268,6 @@ class ThreadHandle(APIResource[ThreadId]):
             after: Optional[MessageId]=None
         ) -> AsyncIterator[Step]:
             '''List messages in the thread.'''
-            
-            print("Listing...")
             
             results = await self.thread.openai.beta.threads.messages.list(
                 self.thread.id, order=order or NOT_GIVEN, after=after or NOT_GIVEN
@@ -411,9 +408,7 @@ class AssistantHandle(APIResource[AssistantId]):
         '''Update assistant configuration.'''
         
         if not isinstance(tools, NotGiven):
-            ltools = [tool.to_schema() for tool in tools]
-        else:
-            ltools = tools
+            tools = [tool.to_schema() for tool in tools] # type: ignore
         
         return await self.openai.beta.assistants.update(
             assistant_id=self.id,
@@ -421,7 +416,7 @@ class AssistantHandle(APIResource[AssistantId]):
             file_ids=file_ids,
             instructions=instructions,
             model=model,
-            tools=ltools # type: ignore
+            tools=tools # type: ignore
         )
     
     async def delete(self):
@@ -452,7 +447,7 @@ class Connection:
     class AssistantEndpoint:
         openai: libopenai.AsyncClient
         
-        def __call__(self, assistant_id):
+        def __call__(self, assistant_id: AssistantId):
             return AssistantHandle(self.openai, assistant_id)
         
         async def create(self,
@@ -480,7 +475,7 @@ class Connection:
     class FileEndpoint:
         openai: libopenai.AsyncClient
         
-        def __call__(self, file_id):
+        def __call__(self, file_id: FileId):
             return FileHandle(self.openai, file_id)
         
         async def create(self, *,
@@ -540,13 +535,10 @@ class Connection:
         
         return res.choices[0].message.content
 
-class Connector:
-    '''Connector strategy, exposes a connect method for connecting to the API.'''
+@asynccontextmanager
+async def connect(api_key: str):
+    '''Connect to the openai provider.'''
     
-    @asynccontextmanager
-    async def connect(self, api_key):
-        '''Connect to the openai provider.'''
-        
-        async with httpx.AsyncClient() as http:
-            async with libopenai.AsyncClient(api_key=api_key, http_client=http) as client:
-                yield Connection(client, api_key)
+    async with httpx.AsyncClient() as http:
+        async with libopenai.AsyncClient(api_key=api_key, http_client=http) as client:
+            yield Connection(client, api_key)

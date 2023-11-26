@@ -1,29 +1,23 @@
 import asyncio
 import sys
-import
 
-from system import Entry
+from system import start
+from tool import Create, Destroy, Subscribe, Unsubscribe, Publish
+
+# Automatically links names to agent types
+import agent
 
 DBPATH = "private/system.db"
 
 async def main(argv):
-    argv[]
     try:
-        async with asyncio.TaskGroup() as tg:
-            entry = Entry(DBPATH, {
-                tool.__name__.lower(): tool
-                for tool in (Create, Destroy, Subscribe, Unsubscribe, Publish)
-            })
-            tg.create_task(entry.start([
-                Create, Destroy, Subscribe, Unsubscribe, Publish
-            ]))
-    
-    except asyncio.CancelledError as e:
-        print("Cancelled?", str(e))
-        raise
+        await start(DBPATH, {
+            tool.__name__.lower(): tool
+            for tool in (Create, Destroy, Subscribe, Unsubscribe, Publish)
+        })
     
     finally:
-        print("Finally", flush=True)
+        print(flush=True)
 
 if __name__ == "__main__":
     asyncio.run(main(sys.argv))

@@ -1,13 +1,12 @@
 from contextlib import contextmanager
 import json
 import time
-from typing import Iterable, Iterator, Literal, Optional
 import sqlite3
 
 from util import read_file
 
-from .connector import AssistantId
-from .typing import json_value, dataclass, dataclasses
+from connector import AssistantId
+from typedef import json_value, dataclass, dataclasses, Iterable, Iterator, Literal, Optional
 
 VERSION = 0
 '''Version counter for database consistency.'''
@@ -99,19 +98,6 @@ class Database:
         cursor.row_factory = lambda conn, row: schema(*row)
         return cursor.execute(query, values)
     
-    def create_archetype(self,
-        name: str,
-        description: str,
-        model: str,
-        config: json_value
-    ) -> ArchetypeRow.primary_key:
-        with self.transaction() as cursor:
-            return cursor.execute('''
-                INSERT INTO archetype (name, description, model, config)
-                    VALUES (?, ?, ?, ?)
-            ''', (name, description, model, json.dumps(config))
-            ).lastrowid or 0
-    
     def create_agent(self,
         type: str, ring: int, name: str,
         description: str, config: json_value
@@ -130,13 +116,13 @@ class Database:
     def destroy_agent(self, agent: AgentRow.primary_key):
         with self.transaction() as cursor:
             cursor.execute('''
-                UPDATE agent SET deleted_at=? WHERE id=?
+                UPDATE agent SET deleted_at=? WHERE rowid=?
             ''', (int(time.time()), agent,))
     
     def subscribe(self, chan: str, agent: AgentRow.primary_key):
         with self.transaction() as cursor:
             cursor.execute('''
-                INSERT INTO subscription (channel, agent_id) VALUES (?, ?)
+                INSERT OR IGNORE INTO subscription (channel, agent_id) VALUES (?, ?)
             ''', (chan, agent))
     
     def unsubscribe(self, channel: str, agent: AgentRow.primary_key):
@@ -151,6 +137,12 @@ class Database:
                 DELETE FROM subscription WHERE channel=?
             ''', (channel,))
     
+    def set_config(self, agent: AgentRow.primary_key, config: json_value):
+        with self.transaction() as cursor:
+            cursor.execute('''
+                UPDATE agent SET config=? WHERE rowid=?
+            ''', (json.dumps(config), agent))
+    
     def push(self,
         channel: str,
         agent: AgentRow.primary_key,
@@ -164,7 +156,7 @@ class Database:
     def push_many(self, rows: Iterable[tuple[str, int, int]]):
         with self.transaction() as cursor:
             cursor.executemany('''
-                INSERT INTO push (channel, agent_id, message_id) VALUES (?, ?, ?)
+                INSERT OR IGNORE INTO push (channel, agent_id, message_id) VALUES (?, ?, ?)
             ''', rows)
     
     def message(self,
@@ -172,13 +164,15 @@ class Database:
         agent: AgentRow.primary_key,
         content: str,
         created_at: int
-    ) -> MessageRow.primary_key:
+    ) -> MessageRow:
         with self.transaction() as cursor:
-            return cursor.execute('''
+            msg_id = cursor.execute('''
                 INSERT INTO message
                     (role, agent_id, content, created_at)
                     VALUES (?, ?, ?, ?)
             ''', (role, agent, content, created_at)).lastrowid or 0
+            
+            return MessageRow(msg_id, role, agent, content, created_at)
     
     def load_archetype_tools(self, archetype: ArchetypeRow.primary_key) -> Iterator[str]:
         return self.cast_execute(str, '''

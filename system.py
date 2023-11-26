@@ -5,12 +5,12 @@ import sqlite3
 from typing import Any
 from prompt_toolkit.patch_stdout import patch_stdout
 
-from .typing import Optional, defaultdict, dataclass, ABC, abstractmethod
-from .config import DUMB_MODEL, MODEL
-from .tool import Tool
-from .util import logger, read_file
-from .connector import AssistantId, Connector, Connection
-from .db import AgentRow, Database, MessageRow
+from typedef import Optional, defaultdict, dataclass, ABC, abstractmethod
+from config import DUMB_MODEL, MODEL
+from tool import Tool
+from util import logger, read_file
+from connector import AssistantId, connect, Connection
+from db import AgentRow, Database, MessageRow
 
 @dataclass
 class Message:
@@ -26,28 +26,6 @@ class Message:
         content = json.dumps(self.content)
         
         return f"[{ts}]\t{self.src.qualname()}:\t{channel}\t{content}"
-
-class GPTArchetype:
-    '''Archetype using openai Assistant API.'''
-    
-    api_id: AssistantId
-    instructions: str
-    tools: list[str]
-    
-    def __init__(self, id, name, description, config):
-        self.id = id
-        self.name = name
-        self.description = description
-        self.config = config
-        
-        self.api_id = config['api_id']
-        self.instructions = config['instructions']
-        self.tools = config['tools']
-    
-    def instantiate(self, id, ring, name, description, config) -> Servitor:
-        return Servitor(
-            self, id, ring, thread_id, name, description, self.tools
-        )
 
 class Agent(ABC):
     '''Abstract agent participating in the consortium.'''
@@ -113,12 +91,12 @@ class Agent(ABC):
             yield self.msgq.get_nowait()
     
     @abstractmethod
-    async def run(self, system: 'Kernel'):
+    async def run(self, kernel: 'Kernel'):
         '''Run the agent.'''
     
-    @abstractmethod
-    async def on_destroy(self, system: 'Kernel'):
+    async def on_destroy(self, kernel: 'Kernel'):
         '''Callback for when the agent is destroyed. Allows alerting subscribers.'''
+        pass
 
 class Kernel:
     '''System architecture object.'''
@@ -144,6 +122,9 @@ class Kernel:
     tools: dict[str, type[Tool]]
     '''Available tools.'''
     
+    agent: Agent
+    '''Agent representing the kernel.'''
+    
     def __init__(self, taskgroup: asyncio.TaskGroup, db: Database, openai: Connection, tools: dict[str, type[Tool]]):
         self.taskgroup = taskgroup
         self.db = db
@@ -153,7 +134,6 @@ class Kernel:
         self.cache = {}
         self.subs = defaultdict(set)
         self.tools = tools
-        self.connector = Connector()
     
     def agent_type(self, name):
         '''Return an agent type given its name.'''
@@ -180,86 +160,12 @@ class Kernel:
         
         assert first is not None
         raise first
-        
-    async def load_archetypes(self):
-        '''Load all archetypes from the database.'''
-        
-        for arch in self.db.load_archetypes():
-            self.archetypes[arch.rowid] = GPTArchetype(
-                arch.rowid, arch.api_id, arch.model, arch.name, tools={
-                    name: self.tools[name]
-                    for name in self.db.load_archetype_tools(arch.rowid)
-                }
-            )
-        
-        if len(self.archetypes) == 0:
-            logger.info(f"No archetypes: initializing 'Default'")
-            
-            instructions = read_file("default.md")
-            model = MODEL
-            name = "Default"
-            description = "Default archetype"
-            
-            await self.create_archetype(
-                model, name, description, instructions, list(self.tools.keys())
-            )
     
-    async def create_archetype(self,
-        model: str,
-        name: str,
-        description: str,
-        instructions: str,
-        tools: list[str]
-    ):
-        assistant = await self.openai.assistant.create(
-            model, name, description, instructions,
-            [self.tools[tool].to_schema() for tool in tools]
-        )
-        api_id = assistant.id
-        id = self.db.create_archetype(
-            name, description, model, None
-        )
+    def update_config(self, agent, config):
+        '''Update the agent's configuration.'''
         
-        archetype = Archetype.registry[model](
-            id, api_id, model, name, {name: self.tools[name] for name in tools}
-        )
-        self.archetypes[id] = archetype
-        return archetype
-    
-    @classmethod
-    async def get(cls, system: Kernel, id: AssistantRow.primary_key) -> 'GPTArchetype':
-        cache = system.cache.get(GPTAgent) or {}
-        if not cache:
-            for assistant in system.db.load_assistants():
-                cache[assistant.rowid] = GPTArchetype(
-                    assistant.rowid,
-                    assistant.name,
-                    assistant.description,
-                    assistant.config
-                )
-            
-            if not cache:
-                logger.info("No assistants: Initializing 'Default'")
-                assistant = await self.openai.assistant.create(
-                    model, name, description, instructions,
-                    [self.tools[tool].to_schema() for tool in tools]
-                )
-                api_id = assistant.id
-                id = self.db.create_archetype(
-                    name, description, model, {
-                        
-                    }
-                    api_id, model, name, description
-                )
-                archetype = Archetype.registry[model](
-                    id, api_id, model, name, {name: self.tools[name] for name in tools}
-                )
-                self.archetypes[id] = archetype
-                return archetype
-            
-            system.cache[GPTAgent] = cache
-        
-        return cache[id]
+        if config:
+            self.db.set_config(agent.id, {**agent.config, **config})
     
     def create_agent(self,
         type: str,
@@ -295,6 +201,7 @@ class Kernel:
         self.db.destroy_agent(id)
         agent = self.agents.pop(id)
         await agent.on_destroy(self)
+        self.unsubscribe_all(agent.idchan())
         
         if agent.name not in self.agents:
             # No other agents have this name, delete it
@@ -337,20 +244,13 @@ class Kernel:
         except KeyError:
             return False
     
-    def publish(self, agent: Agent, chan: str, content: str):
-        '''
-        Publish a message to a channel.
+    def push(self, chan: str, row: MessageRow):
+        '''Push a message to a channel. (One db message -> many pushes)'''
         
-        Returns whether or not the channel has subscribers.
-        '''
-        
-        logger.info(f"publish({agent.qualname()!r}, {chan!r}, {content!r})")
-        
-        logger.debug("publish(): Creating message")
-        
-        created_at = int(time.time())
-        msg_id = self.db.message("user", agent.id, content, created_at)
-        msg = Message(msg_id, agent, chan, content, created_at)
+        msg = Message(
+            row.rowid, self.agents[row.agent_id],
+            chan, row.content, row.created_at
+        )
         
         if chan == "*":
             # Broadcast
@@ -360,12 +260,17 @@ class Kernel:
             if subscribers is None:
                 return False
         
+        broadcast = self.subs.get("*") or set()
+        
         logger.debug("publish(): Push")
         pushes: list[tuple[str, int, int]] = []
         for target in subscribers:
+            if target.id in broadcast:
+                continue
+            
             pushes.append((chan, target.id, msg.id))
             # Do not push to the agent, thread automatically adds it
-            if target.id != agent.id:
+            if target.id != row.agent_id:
                 target.push(msg)
         self.db.push_many(pushes)
         
@@ -373,29 +278,63 @@ class Kernel:
         
         return True
     
+    def publish(self, agent: Agent, chan: Optional[str], content: str):
+        '''
+        Publish a message to a channel.
+        If channel is unspecified, publish to subscribers of the agent (name and id).
+        
+        Returns whether or not the channel has subscribers.
+        '''
+        
+        logger.info(f"publish({agent.qualname()!r}, {chan!r}, {content!r})")
+        logger.debug("publish(): Creating message")
+        
+        created_at = int(time.time())
+        row = self.db.message("user", agent.id, content, created_at)
+        
+        # Broadcast subscribers get all messages
+        broadcast = self.subs.get("*")
+        if broadcast is not None:
+            pushes = []
+            for target in broadcast:
+                pushes.append((chan or "", target.id, row.rowid))
+                if target.id != row.agent_id:
+                    target.push(Message(row.rowid, agent, chan or "", content, created_at))
+            self.db.push_many(pushes)
+        
+        if chan is None:
+            self.push(agent.idchan(), row)
+            self.push(agent.name, row)
+            return True
+        else:
+            return self.push(chan, row)
+    
     async def load_agents(self):
         '''Reload all agents from the database.'''
         
         logger.info("Loading agents...")
         self.agents.clear()
         for row in self.db.load_agents():
+            config = json.loads(row.config)
             agent = self.agent_type(row.type)(
-                row.rowid, row.name, row.description, row.ring, row.config
+                row.rowid, row.name, row.description, row.ring, config
             )
             self.agents[agent.id] = agent
         
         if len(self.agents) == 0:
             logger.info(f"No agents: Initializing...")
             
-            self.create_agent("Kernel")
+            self.create_agent("System")
+            self.create_agent("User")
             self.create_agent("Supervisor")
+        
+        self.agent = self.agents[1]
     
     def load_subcriptions(self):
         '''Reload all subscriptions from the database.'''
         
         logger.debug("Loading subscriptions...")
         self.subs.clear()
-        print("load_subscriptions", self.agents)
         for sub in self.db.load_subscriptions():
             self.subs[sub.channel].add(self.agents[sub.agent_id])
     
@@ -405,25 +344,30 @@ class Kernel:
         
         for agent in self.agents.values():
             self.taskgroup.create_task(agent.run(self))
+    
+    def exit(self):
+        current = None
+        for task in self.taskgroup._tasks:
+            if task == asyncio.current_task():
+                current = task
+            if task.done() or task == asyncio.current_task():
+                continue
+            task.cancel()
+        
+        if current:
+            current.cancel()
 
-class Entry:
+async def start(dbpath: str, tools: dict[str, type[Tool]]):
     '''
     Entrypoint for the kernel, initializes everything so we don't have to
     constantly check if things are initialized.
     '''
+    api_key = read_file("private/api.key")
     
-    def __init__(self, dbpath, tools):
-        self.dbpath = dbpath
-        self.connector = Connector()
-        self.tools = tools
-    
-    async def start(self, tools):
-        api_key = read_file("private/api.key")
-        
-        with patch_stdout():
-            async with self.connector.connect(api_key) as client:
-                with sqlite3.Connection(self.dbpath) as sql:
-                    async with asyncio.TaskGroup() as tg:
-                        db = Database(sql)
-                        system = Kernel(tg, db, client, tools)
-                        asyncio.create_task(system.start())
+    with patch_stdout():
+        async with connect(api_key) as client:
+            with sqlite3.Connection(dbpath) as sql:
+                async with asyncio.TaskGroup() as tg:
+                    db = Database(sql)
+                    system = Kernel(tg, db, client, tools)
+                    tg.create_task(system.start())

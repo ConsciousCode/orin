@@ -10,15 +10,13 @@ CREATE TABLE IF NOT EXISTS archetype (
 /* Identify agents. Append-only */
 CREATE TABLE IF NOT EXISTS agent (
     /* rowid */
+    type TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     deleted_at INTEGER,
-    type TEXT NOT NULL,
     ring INTEGER NOT NULL,
     name TEXT NOT NULL,
     description TEXT NOT NULL,
-    config TEXT NOT NULL,
-    
-    env BLOB NOT NULL
+    config TEXT NOT NULL
 );
 
 /*
