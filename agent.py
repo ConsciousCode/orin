@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 import openai
+import traceback
 
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit import PromptSession
@@ -63,7 +64,14 @@ class GPTAgent(Agent):
         if tools is None:
             tools = getattr(self, "tools", [])
         self.tools = tools
-        #self.tools = getattr(self, "tools", []) if tools is None else tools
+    
+    def __str__(self):
+        if isinstance(self.tools, dict):
+            tools = self.tools.values()
+        else:
+            tools = self.tools
+        ts = '\n  '.join(map(str, tools))
+        return f"{super().__str__()} {self.assistant_id} {self.thread_id}\n  {ts}"
     
     @override
     def state(self):
@@ -91,7 +99,7 @@ class GPTAgent(Agent):
         
         if last and last.completed_at is None:
             self.run_id = last.id
-            logger.info(f"Resuming {self.run_id}")
+            logger.info(f"Resuming {self.run_id} in {self.thread_id}")
     
     @override
     async def run(self, kernel: Kernel):
@@ -195,7 +203,6 @@ class Supervisor(GPTAgent):
     ring = 1
     name = "Supervisor"
     description = str(__doc__)
-    instructions = read_file("supervisor.md")
     assistant_id = "asst_6SnQRYaBJOptljPpvJTvOd5o"
     tools = ["subscribe", "unsubscribe", "publish", "create", "destroy", 'python', 'shell']
     
@@ -265,11 +272,8 @@ class User(Agent):
         
         try:
             match [cmd, *rest.split(' ')]:
-                case ['thread', thread_id]:
-                    if thread_id.startswith("+"):
-                        after = thread_id[1:]
-                    else:
-                        after = None
+                case ['thread', thread_id, *rest]:
+                    after = rest[0] if len(rest) > 0 else None
                     async for step in kernel.openai.thread(thread_id).message.list(order="asc", after=after):
                         for content in step.content:
                             match content:
@@ -281,7 +285,7 @@ class User(Agent):
                 
                 case ['run', sub, thread_id, *rest]:
                     thread = kernel.openai.thread(thread_id)
-                    match (sub, *rest):
+                    match [sub, *rest]:
                         case ['list']:
                             ls = []
                             async for run in thread.run.iter():
@@ -304,6 +308,31 @@ class User(Agent):
         
         except openai.APIError as e:
             logger.error(f"{typename(e)}: {e.message}")
+    
+    async def agent_command(self, kernel: Kernel, rest: str):
+        match rest.split(' ', 1):
+            case ['list', *_]:
+                for agent in kernel.agents.values():
+                    print(agent.qualname())
+            
+            case ['get', ref]:
+                print(kernel.by_ref(ref))
+            
+            case ['pause', ref]:
+                kernel.by_ref(ref).pause()
+            
+            case ['resume', ref]:
+                kernel.by_ref(ref).resume()
+            
+            case ['subs', ref]:
+                for chan in kernel.subs_of(kernel.by_ref(ref)):
+                    print(chan)
+            
+            case ['destroy', ref]:
+                await kernel.destroy(kernel.by_ref(ref).id)
+            
+            case [cmd, *_]:
+                print("Unknown subcommand", cmd)
     
     @override
     def push(self, msg: Message):
@@ -344,61 +373,71 @@ class User(Agent):
                 pass
             
             else:
-                cmd, *rest = user[1:].split(' ', 1)
-                match cmd:
-                    case "help":
-                        print("# help quit sql select thread run{list, get, cancel} pause resume{all}/unpause{all}")
-                    
-                    case "quit": kernel.exit()
-                    case "sql"|"select":
-                        self.sql_command(kernel, cmd, rest[0])
-                    
-                    case "thread"|"run":
-                        await self.openai_command(kernel, cmd, rest[0])
-                    
-                    case "pause":
-                        if len(rest) == 0:
-                            kernel.pause()
-                        elif rest[0] == 'all':
-                            for agent in kernel.agents.values():
-                                agent.pause()
-                        else:
-                            try:
-                                kernel.agents[int(rest[0], 16)].pause()
-                            except ValueError:
-                                print(cmd, "only takes hex ids")
-                    
-                    case "resume"|"unpause":
-                        if len(rest) == 0:
-                            kernel.resume()
-                        elif rest[0] == 'all':
-                            for agent in kernel.agents.values():
-                                agent.resume()
-                        else:
-                            try:
-                                kernel.agents[int(rest[0], 16)].resume()
-                            except ValueError:
-                                print(cmd, "only takes hex ids")
-                    
-                    case "msg":
-                        if len(rest) == 0:
-                            print("Usage: /msg <channel> <message>")
-                        else:
-                            chan, msg = rest[0].split(' ', 1)
-                            kernel.publish(self, chan, msg)
-                    
-                    case "poke":
-                        if len(rest) == 0:
-                            print("Usage: /poke <id>")
-                        else:
-                            try:
-                                kernel.agents[int(rest[0], 16)].poke()
-                            except ValueError:
-                                print("poke only takes hex ids")
-                    
-                    case "subs":
-                        for chan, subs in kernel.subs.items():
-                            print(chan, ":", ' / '.join(sub.name for sub in subs))
-                    
-                    case _:
-                        print("Unknown command", cmd)
+                try:
+                    cmd, *rest = user[1:].split(' ', 1)
+                    match cmd:
+                        case "help":
+                            print("# help quit sql select thread run{list, get, cancel} pause resume{all} agent{list, get, pause, resume} msg poke subs")
+                        
+                        case "quit": kernel.exit()
+                        case "sql"|"select":
+                            if len(rest) == 0:
+                                print("Usage: /sql <query> or /select <query>")
+                            else:
+                                self.sql_command(kernel, cmd, rest[0])
+                        
+                        case "agent":
+                            if len(rest) == 0:
+                                print("Usage: /agent <command> <id>")
+                            else:
+                                await self.agent_command(kernel, rest[0])
+                        
+                        case "thread"|"run":
+                            await self.openai_command(kernel, cmd, rest[0])
+                        
+                        case "pause":
+                            if len(rest) == 0:
+                                kernel.pause()
+                            elif rest[0] == 'all':
+                                for agent in kernel.agents.values():
+                                    agent.pause()
+                            else:
+                                try:
+                                    kernel.agents[int(rest[0], 16)].pause()
+                                except ValueError:
+                                    print(cmd, "only takes hex ids")
+                        
+                        case "resume":
+                            if len(rest) == 0:
+                                kernel.resume()
+                            elif rest[0] == 'all':
+                                for agent in kernel.agents.values():
+                                    agent.resume()
+                            else:
+                                kernel.by_ref(rest[0]).resume()
+                        
+                        case "msg":
+                            if len(rest) == 0:
+                                print("Usage: /msg <channel> <message>")
+                            else:
+                                chan, msg = rest[0].split(' ', 1)
+                                kernel.publish(self, chan, msg)
+                        
+                        case "poke":
+                            if len(rest) == 0:
+                                print("Usage: /poke <id>")
+                            else:
+                                kernel.by_ref(rest[0]).poke()
+                        
+                        case "subs":
+                            if len(rest) == 0:
+                                for chan, subs in kernel.subs.items():
+                                    print(chan, ":", ' / '.join(sub.name for sub in subs))
+                            else:
+                                for chan in kernel.subs_of(kernel.by_ref(rest[0])):
+                                    print(chan)
+                        
+                        case _:
+                            print("Unknown command", cmd)
+                except Exception as e:
+                    traceback.print_exception(e)

@@ -114,6 +114,10 @@ class Agent(ABC):
         self.pause_signal = asyncio.Event()
         self.resume()
     
+    def __str__(self):
+        pause = " (paused)" if self.is_paused() else ""
+        return f"{self.qualname()}{pause} {self.description}"
+    
     def until_unpaused(self):
         '''Wait until the agent is unpaused, if it's paused.'''
         return self.pause_signal.wait()
@@ -135,7 +139,7 @@ class Agent(ABC):
     
     def qualname(self) -> str:
         '''Return the fully qualified name of the agent, including any ids.'''
-        return f"{self.name}{self.idchan()}:{self.ring}"
+        return f"{self.name!r}{self.idchan()}:{self.ring}"
     
     def poke(self):
         '''Poke the agent to generate without an input message.'''
@@ -230,10 +234,51 @@ class Kernel:
         
         self.db.add_state(agent.id, agent.state())
     
-    def agent_type(self, name):
+    def agent_type(self, name: str):
         '''Return an agent type given its name.'''
         
         return Agent.registry[name]
+    
+    def by_name(self, name: str):
+        '''Get all agents with the given name.'''
+        
+        name = name.lower()
+        for agent in self.agents.values():
+            if agent.name.lower() == name:
+                yield agent
+    
+    def by_id(self, id: AgentRow.primary_key):
+        '''Get the agent with the given id.'''
+        return self.agents[id]
+    
+    def by_ref(self, ref: str|AgentRow.primary_key):
+        '''Get the agent with the given reference.'''
+        if isinstance(ref, int):
+            return self.by_id(ref)
+        
+        if ref.startswith("@"):
+            return self.by_id(int(ref[1:], 16))
+        
+        try:
+            return self.by_id(int(ref, 16))
+        except ValueError:
+            pass
+        
+        last = None
+        for agent in self.by_name(ref):
+            if last is not None:
+                raise ValueError(f"Multiple agents with name {ref!r}")
+            last = agent
+        
+        if last is None:
+            raise KeyError(ref)
+        return last
+    
+    def subs_of(self, agent: Agent):
+        '''Get the subscriptions of the given agent.'''
+        for chan, agents in self.subs.items():
+            if agent in agents:
+                yield chan
     
     async def parse_json(self, doc: str):
         '''Attempt to parse the JSON using an LLM as backup for typos.'''
@@ -297,26 +342,20 @@ class Kernel:
         if agent is None:
             return False
         
+        # TODO: Breaks if program is killed during agent destruction
         self.db.destroy_agent(id)
         del self.agents[id]
         await agent.on_destroy(self)
         self.unsubscribe_all(agent.idchan())
         
-        for ag in self.agents:
-            if ag == agent.name:
-                break
-        else:
+        if not any(self.by_name(agent.name)):
             # No other agents have this name, delete it
-            self.subs.pop(agent.name, None)
+            self.unsubscribe_all(agent.name)
     
     def subscribe(self, agent: Agent, chan: str):
         '''Subscribe an agent to channel.'''
         
-        chan = chan.lower()
-        # Logical id without 0 padding
-        if chan.startswith("@"):
-            chan = f"@{int(chan[1:], 16)}"
-        
+        chan = normalize_chan(chan)
         logger.info(f"subscribe({agent.qualname()!r}, {chan!r})")
         
         self.db.subscribe(chan, agent.id)
@@ -325,6 +364,7 @@ class Kernel:
     def unsubscribe_all(self, chan: str):
         '''Unsubcribe all agents from a channel.'''
         
+        chan = normalize_chan(chan)
         logger.info(f"unsubscribe_all({chan!r})")
         
         assert self.db is not None
@@ -334,6 +374,7 @@ class Kernel:
     def unsubscribe(self, agent: Agent, chan: str):
         '''Unsubscribe agent from channel.'''
         
+        chan = normalize_chan(chan)
         logger.info(f"unsubscribe({agent.qualname()!r}, {chan!r})")
         
         self.db.unsubscribe(chan, agent.id)
@@ -353,25 +394,20 @@ class Kernel:
         '''Push a message to a channel. (One db message -> many pushes)'''
         
         chan = normalize_chan(chan)
-        
         msg = Message(
-            row.rowid, self.agents[row.agent_id],
+            row.rowid, self.by_id(row.agent_id),
             chan, row.content, row.created_at
         )
         
         if chan == "*":
-            # Broadcast to all agentsz
+            # Broadcast to all agents
             subscribers = self.agents.values()
         else:
             subscribers = self.subs.get(chan)
             if subscribers is None:
                 return False
         
-        bs = self.subs.get("*")
-        if bs is None:
-            broadcast: set[AgentRow.primary_key] = set()
-        else:
-            broadcast = {agent.id for agent in bs}
+        broadcast = {agent.id for agent in self.subs.get("*") or set()}
         
         pushes: list[tuple[str, int, int]] = []
         for target in subscribers:
@@ -385,7 +421,7 @@ class Kernel:
                 target.push(msg)
         self.db.push_many(pushes)
         
-        logger.debug(f"publish(): {pushes}")
+        logger.debug(f"push(): {pushes}")
         
         return True
     
@@ -398,7 +434,6 @@ class Kernel:
         '''
         
         chan = normalize_chan(chan)
-        
         logger.info(f"publish({agent.qualname()!r}, {chan!r})")
         
         created_at = int(time.time())
@@ -441,7 +476,7 @@ class Kernel:
             await self.create_agent("User")
             await self.create_agent("Supervisor")
         
-        self.agent = self.agents[1]
+        self.agent = self.by_id(1)
     
     def load_subcriptions(self):
         '''Reload all subscriptions from the database.'''
@@ -449,7 +484,7 @@ class Kernel:
         logger.info("Loading subscriptions...")
         self.subs.clear()
         for sub in self.db.load_subscriptions():
-            self.subs[sub.channel].add(self.agents[sub.agent_id])
+            self.subs[sub.channel].add(self.by_id(sub.agent_id))
     
     async def start(self):
         await self.load_agents()

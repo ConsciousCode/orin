@@ -106,10 +106,10 @@ class Destroy(Tool):
     }
     
     async def __call__(self, agent):
-        if self.agent.ring <= self.kernel.agents[agent].ring:
+        if self.kernel.agents[agent].ring <= self.agent.ring: 
             raise PermissionError("Attempting to destroy an agent in equal or higher ring")
         
-        if not self.kernel.destroy(agent):
+        if not await self.kernel.destroy(agent):
             return {"warning": "Attempted to destroy nonexistent agent."}
 
 class Subscribe(Tool):
