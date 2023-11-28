@@ -83,7 +83,7 @@ class Create(Tool):
         }
     }
     
-    async def __call__(self, ring, model, name, description, instructions, tools):
+    async def __call__(self, ring, model, name, description, instructions, tools) -> int:
         if ring <= self.agent.ring:
             raise PermissionError("Attempting to create an agent in equal or lower ring")
         
@@ -91,11 +91,12 @@ class Create(Tool):
         
         thread = await self.kernel.openai.thread.create()
         
-        return self.kernel.create_agent("GPTAgent", ring, name, description, {
+        agent = await self.kernel.create_agent("GPTAgent", ring, name, description, {
             "tools": tools,
-            "assistant": assistant,
-            "thread": thread
+            "assistant": assistant.id,
+            "thread": thread.id
         })
+        return agent.id
 
 class Destroy(Tool):
     '''Destroy an existing agent.'''

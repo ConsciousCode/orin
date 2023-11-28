@@ -5,7 +5,7 @@ import sqlite3
 from prompt_toolkit.patch_stdout import patch_stdout
 import inspect
 
-from typedef import Optional, defaultdict, dataclass, ABC, abstractmethod, Any
+from typedef import Optional, defaultdict, dataclass, ABC, abstractmethod, Any, json_value, AsyncIterator
 from config import DUMB_MODEL, MODEL
 from util import logger, read_file, typename
 from connector import AssistantId, connect, Connection
@@ -91,7 +91,7 @@ class Agent(ABC):
     config: Any
     '''Local configuration for the agent.'''
     
-    msg: asyncio.Queue[Message]
+    msg: asyncio.Queue[Optional[Message]]
     '''Pending messages to be processed.'''
     
     def __init__(self,
@@ -117,18 +117,25 @@ class Agent(ABC):
         '''Return the fully qualified name of the agent, including any ids.'''
         return f"{self.name}{self.idchan()}:{self.ring}"
     
+    def poke(self):
+        '''Poke the agent to generate without an input message.'''
+        self.msgq.put_nowait(None)
+        
     def push(self, msg: Message):
         '''Push a message to the agent.'''
-        logger.debug(f"Servitor.push {msg}")
         self.msgq.put_nowait(msg)
     
-    async def pull(self):
+    async def pull(self) -> AsyncIterator[Message]:
         '''Pull all pending messages from the message queue.'''
         
-        yield await self.msgq.get()
+        msg = await self.msgq.get()
+        if msg is not None:
+            yield await self.msgq.get()
         
         while not self.msgq.empty():
-            yield self.msgq.get_nowait()
+            msg = self.msgq.get_nowait()
+            if msg is not None:
+                yield msg
     
     async def init(self, kernel: "Kernel", state: object):
         '''Initialize the agent.'''
@@ -234,12 +241,12 @@ class Kernel:
         if config:
             self.db.set_config(agent.id, {**agent.config, **config})
     
-    def create_agent(self,
+    async def create_agent(self,
         type: str,
         ring: Optional[int]=None,
         name: Optional[str]=None,
         description: Optional[str]=None,
-        config: Any=None
+        config: json_value=None
     ):
         '''Create a new agent.'''
         
@@ -253,6 +260,9 @@ class Kernel:
             config
         )
         agent = AgentType(agent_id, name, description, ring, config)
+        self.subscribe(agent, agent.name)
+        self.subscribe(agent, agent.idchan())
+        await agent.init(self, None)
         self.agents[agent_id] = agent
         self.taskgroup.create_task(agent.run(self))
         return agent
@@ -280,6 +290,11 @@ class Kernel:
     
     def subscribe(self, agent: Agent, chan: str):
         '''Subscribe an agent to channel.'''
+        
+        chan = chan.lower()
+        # Logical id without 0 padding
+        if chan.startswith("@"):
+            chan = f"@{int(chan[1:], 16)}"
         
         logger.info(f"subscribe({agent.qualname()!r}, {chan!r})")
         
@@ -334,6 +349,7 @@ class Kernel:
         logger.debug("publish(): Push")
         pushes: list[tuple[str, int, int]] = []
         for target in subscribers:
+            # Don't double-push to broadcast subscribers
             if target.id in broadcast:
                 continue
             
@@ -343,7 +359,7 @@ class Kernel:
                 target.push(msg)
         self.db.push_many(pushes)
         
-        logger.debug("publish(): Finish")
+        logger.debug(f"publish(): {pushes}")
         
         return True
     
@@ -354,6 +370,15 @@ class Kernel:
         
         Returns whether or not the channel has subscribers.
         '''
+        
+        if chan == "@":
+            raise NotImplemented("Id channel with empty id")
+        
+        if chan is not None:
+            chan = chan.lower()
+            # Logical id without 0 padding
+            if chan.startswith("@"):
+                chan = f"@{int(chan[1:], 16)}"
         
         logger.info(f"publish({agent.qualname()!r}, {chan!r}, {content!r})")
         logger.debug("publish(): Creating message")
@@ -394,16 +419,16 @@ class Kernel:
         if len(self.agents) == 0:
             logger.info(f"No agents: Initializing...")
             
-            self.create_agent("System")
-            self.create_agent("User")
-            self.create_agent("Supervisor")
+            await self.create_agent("System")
+            await self.create_agent("User")
+            await self.create_agent("Supervisor")
         
         self.agent = self.agents[1]
     
     def load_subcriptions(self):
         '''Reload all subscriptions from the database.'''
         
-        logger.debug("Loading subscriptions...")
+        logger.info("Loading subscriptions...")
         self.subs.clear()
         for sub in self.db.load_subscriptions():
             self.subs[sub.channel].add(self.agents[sub.agent_id])

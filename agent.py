@@ -50,7 +50,7 @@ class GPTAgent(Agent):
         name: str,
         description: str,
         ring: int,
-        config: Any
+        config: dict
     ):
         if config is None:
             config = {}
@@ -59,7 +59,11 @@ class GPTAgent(Agent):
         self.assistant_id = config.get("assistant") or self.assistant_id
         self.thread_id = config.get('thread') or getattr(self, "thread", None) # type: ignore
         self.run_id = None
-        self.tools = config.get('tools') or self.tools
+        tools = config.get('tools')
+        if tools is None:
+            tools = getattr(self, "tools", [])
+        self.tools = tools
+        #self.tools = getattr(self, "tools", []) if tools is None else tools
     
     @override
     def state(self):
@@ -291,13 +295,11 @@ class User(Agent):
         '''User input agent.'''
         
         tty = PromptSession()
-        kernel.subscribe(self, "*")
         
         # NOTE: User agent does not respect kernel pausing, otherwise
         #  it would be locked forever.
         
         while True:
-            logger.debug("User(): Loop")
             try:
                 with patch_stdout():
                     user = await tty.prompt_async(FormattedText([('ansiyellow', 'User> ')]))
@@ -311,7 +313,16 @@ class User(Agent):
             if user == "":
                 continue
             
-            if user.startswith("/"):
+            if not user.startswith("/") or user.startswith("//"):
+                if user.startswith("/"):
+                    user = user[1:]
+                
+                kernel.publish(self, "*", user)
+            
+            elif user == "/" or user.startswith("/#"):
+                pass
+            
+            else:
                 cmd, *rest = user[1:].split(' ', 1)
                 match cmd:
                     # Comment
@@ -332,9 +343,18 @@ class User(Agent):
                     case "resume"|'unpause':
                         kernel.resume()
                     
+                    case "msg":
+                        if len(rest) == 0:
+                            print("Usage: /msg <channel> <message>")
+                        else:
+                            chan, msg = rest[0].split(' ', 1)
+                            kernel.publish(self, chan, msg)
+                    
+                    case "poke":
+                        if len(rest) == 0:
+                            print("Usage: /poke <id>")
+                        else:
+                            kernel.agents[int(rest[0], 16)].poke()
+                    
                     case _:
                         print("Unknown command", cmd)
-            else:
-                logger.debug("Before publish")
-                kernel.publish(self, "*", user)
-                logger.debug("After publish")
