@@ -297,10 +297,17 @@ class ThreadHandle(APIResource[ThreadId]):
         def __call__(self, run: RunId):
             return RunHandle(self.thread.openai, run, self.thread.id)
         
-        async def iter(self):
+        async def iter(self, *,
+            order: Literal['asc', 'desc']|NotGiven=NOT_GIVEN,
+            after: RunId|NotGiven=NOT_GIVEN,
+            limit: int|NotGiven=NOT_GIVEN
+        ):
             '''Iterate over thread run API resources.'''
             result = await self.thread.openai.beta.threads.runs.list(
-                thread_id=self.thread.id
+                thread_id=self.thread.id,
+                after=after,
+                limit=limit,
+                order=order
             )
             async for run in result:
                 yield run

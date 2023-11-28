@@ -126,6 +126,9 @@ class Agent(ABC):
         '''Unpause the agent.'''
         self.pause_signal.set()
     
+    def is_paused(self):
+        return not self.pause_signal.is_set()
+    
     def idchan(self):
         '''Get the channel for the agent's id.'''
         return f"@{self.id:04x}"
@@ -219,6 +222,9 @@ class Kernel:
         '''Unpause all agents.'''
         self.pause_signal.set()
     
+    def is_paused(self):
+        return not self.pause_signal.is_set()
+    
     def add_state(self, agent: Agent):
         '''Add the agent's state to the database.'''
         
@@ -276,7 +282,7 @@ class Kernel:
         )
         agent = AgentType(agent_id, name, description, ring, config)
         self.subscribe(agent, agent.name)
-        self.subscribe(agent, agent.idchan())
+        self.subscribe(agent, f"@{agent.id:x}")
         await agent.init(self, None)
         self.agents[agent_id] = agent
         self.taskgroup.create_task(agent.run(self))
@@ -361,7 +367,11 @@ class Kernel:
             if subscribers is None:
                 return False
         
-        broadcast = self.subs.get("*") or set()
+        bs = self.subs.get("*")
+        if bs is None:
+            broadcast: set[AgentRow.primary_key] = set()
+        else:
+            broadcast = {agent.id for agent in bs}
         
         pushes: list[tuple[str, int, int]] = []
         for target in subscribers:

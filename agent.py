@@ -82,9 +82,12 @@ class GPTAgent(Agent):
             tool: kernel.tools[tool](kernel, self)
             for tool in self.tools
         }
-        last = None
-        async for run in kernel.openai.thread(self.thread_id).run.iter():
-            last = run
+        try:
+            last = await anext(kernel.openai.thread(self.thread_id).run.iter(
+                order="desc", limit=1
+            ))
+        except StopAsyncIteration:
+            last = None
         
         if last and last.completed_at is None:
             self.run_id = last.id
@@ -107,16 +110,17 @@ class GPTAgent(Agent):
         thread = kernel.openai.thread(self.thread_id)
         
         while True:
-            while self.pause_signal.is_set() or kernel.pause_signal.is_set():
+            last = None
+            while self.is_paused() or kernel.is_paused():
                 await self.until_unpaused()
                 await kernel.until_unpaused()
-            logger.debug(f"Resume: {self.name}")
-            
-            # Consume all pushed messages, adding to the thread
-            last = None
-            async for msg in self.pull():
-                last = await thread.message.create(str(msg))
-            logger.debug(f"Messages: {self.name}")
+                
+                logger.debug(f"Resume: {self.name}")
+                
+                # Consume all pushed messages, adding to the thread
+                async for msg in self.pull():
+                    last = await thread.message.create(str(msg))
+                logger.debug(f"Messages: {self.name}")
             
             # Got a poke, pick the most recent message
             if last is None:
@@ -317,12 +321,11 @@ class User(Agent):
             try:
                 with patch_stdout():
                     paused = kernel.pause_signal.is_set()
-                    icon = "▶️" if paused else "⏸"
+                    icon = " " if paused else "⏸"
                     user = await tty.prompt_async(FormattedText(
                         [('ansiyellow', f'{icon} User> ')]
                     ))
             except asyncio.CancelledError:
-                logger.debug("User(): Cancel")
                 break
             except KeyboardInterrupt:
                 kernel.exit()
@@ -353,14 +356,29 @@ class User(Agent):
                     case "thread"|"run":
                         await self.openai_command(kernel, cmd, rest[0])
                     
-                    case "pause"|'resume':
+                    case "pause":
                         if len(rest) == 0:
-                            getattr(kernel, cmd)()
+                            kernel.pause()
                         elif rest[0] == 'all':
                             for agent in kernel.agents.values():
-                                getattr(agent, cmd)()
+                                agent.pause()
                         else:
-                            getattr(kernel.agents[int(rest[0], 16)], cmd)()
+                            try:
+                                kernel.agents[int(rest[0], 16)].pause()
+                            except ValueError:
+                                print(cmd, "only takes hex ids")
+                    
+                    case "resume"|"unpause":
+                        if len(rest) == 0:
+                            kernel.resume()
+                        elif rest[0] == 'all':
+                            for agent in kernel.agents.values():
+                                agent.resume()
+                        else:
+                            try:
+                                kernel.agents[int(rest[0], 16)].resume()
+                            except ValueError:
+                                print(cmd, "only takes hex ids")
                     
                     case "msg":
                         if len(rest) == 0:
@@ -373,7 +391,10 @@ class User(Agent):
                         if len(rest) == 0:
                             print("Usage: /poke <id>")
                         else:
-                            kernel.agents[int(rest[0], 16)].poke()
+                            try:
+                                kernel.agents[int(rest[0], 16)].poke()
+                            except ValueError:
+                                print("poke only takes hex ids")
                     
                     case "subs":
                         for chan, subs in kernel.subs.items():
