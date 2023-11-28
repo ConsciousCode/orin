@@ -87,12 +87,9 @@ class TextContent:
 type Content = ImageContent|TextContent
 
 @dataclass
-class Step:
-    content: list[Content]
-
-@dataclass
 class Message:
-    content: str
+    id: MessageId
+    content: list[Content]
     file_ids: list[FileId] = field(default_factory=list)
     
     def to_schema(self):
@@ -264,7 +261,7 @@ class ThreadHandle(APIResource[ThreadId]):
         async def list(self, *,
             order: Optional[Literal['asc', 'desc']]=None,
             after: Optional[MessageId]=None
-        ) -> AsyncIterator[Step]:
+        ) -> AsyncIterator[Message]:
             '''List messages in the thread.'''
             
             results = await self.thread.openai.beta.threads.messages.list(
@@ -287,7 +284,7 @@ class ThreadHandle(APIResource[ThreadId]):
                         case _:
                             raise TypeError(f"Unknown content type: {content.type!r}")
                 
-                yield Step(parts)
+                yield Message(result.id, parts, result.file_ids)
     
     @cached_property
     def message(self):

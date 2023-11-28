@@ -100,22 +100,28 @@ class GPTAgent(Agent):
         assistant = kernel.openai.assistant(self.assistant_id)
         if self.thread_id is None:
             # Create a new thread
-            thread_id = (await kernel.openai.thread.create()).id
-            self.thread_id = thread_id
+            self.thread_id = (await kernel.openai.thread.create()).id
             kernel.update_config(self, {
                 "thread": self.thread_id
             })
         thread = kernel.openai.thread(self.thread_id)
         
         while True:
-            await kernel.until_unpaused()
+            while self.pause_signal.is_set() or kernel.pause_signal.is_set():
+                await self.until_unpaused()
+                await kernel.until_unpaused()
+            logger.debug(f"Resume: {self.name}")
             
             # Consume all pushed messages, adding to the thread
             last = None
             async for msg in self.pull():
                 last = await thread.message.create(str(msg))
-            # last is now the last message in the thread
-            assert last is not None
+            logger.debug(f"Messages: {self.name}")
+            
+            # Got a poke, pick the most recent message
+            if last is None:
+                msg = await anext(thread.message.list(order="desc"))
+                last = thread.message(msg.id)
             
             # Support recovering an existing run
             if self.run_id is None:
@@ -143,13 +149,17 @@ class GPTAgent(Agent):
                                 except BaseException as e:
                                     content = f"{typename(e)}: {e.args[0]}"
                             
-                            logger.info(f"Return: {func} {content}")
+                            logger.info(f"Return {func}: {content}")
                             step = await run.asend(content)
                         
                         case _:
                             raise TypeError(f"Unknown step: {typename(step)}")
             
             self.run_id = None
+            
+            # Edge case: Got a poke on a brand new thread
+            if last is None:
+                continue
             
             # TODO: Edge case, if agent swarm manager is stopped here then the
             #  unnamed channel won't publish to subscribers. To fix, you would
@@ -197,6 +207,10 @@ class Supervisor(GPTAgent):
 def print_sql(cursor: sqlite3.Cursor, rows: list[sqlite3.Row]):
     '''Print the results of a SQL query.'''
     
+    if len(rows) == 0:
+        print("empty set")
+        return
+    
     if cursor.description is not None:
         # Fetch column headers
         headers = [desc[0] for desc in cursor.description]
@@ -217,7 +231,7 @@ def print_sql(cursor: sqlite3.Cursor, rows: list[sqlite3.Row]):
         print(cursor.rowcount, "rows affected")
     
     if len(rows) > 0:
-        print(len(rows), "rows in set")
+        print('\n', len(rows), "rows in set")
 
 @Agent.register
 class User(Agent):
@@ -302,7 +316,11 @@ class User(Agent):
         while True:
             try:
                 with patch_stdout():
-                    user = await tty.prompt_async(FormattedText([('ansiyellow', 'User> ')]))
+                    paused = kernel.pause_signal.is_set()
+                    icon = "▶️" if paused else "⏸"
+                    user = await tty.prompt_async(FormattedText(
+                        [('ansiyellow', f'{icon} User> ')]
+                    ))
             except asyncio.CancelledError:
                 logger.debug("User(): Cancel")
                 break
@@ -325,11 +343,8 @@ class User(Agent):
             else:
                 cmd, *rest = user[1:].split(' ', 1)
                 match cmd:
-                    # Comment
-                    case "#":
-                        pass
                     case "help":
-                        print("# help quit sql select thread run{list, get, cancel} pause resume/unpause")
+                        print("# help quit sql select thread run{list, get, cancel} pause resume{all}/unpause{all}")
                     
                     case "quit": kernel.exit()
                     case "sql"|"select":
@@ -338,10 +353,14 @@ class User(Agent):
                     case "thread"|"run":
                         await self.openai_command(kernel, cmd, rest[0])
                     
-                    case "pause":
-                        kernel.pause()
-                    case "resume"|'unpause':
-                        kernel.resume()
+                    case "pause"|'resume':
+                        if len(rest) == 0:
+                            getattr(kernel, cmd)()
+                        elif rest[0] == 'all':
+                            for agent in kernel.agents.values():
+                                getattr(agent, cmd)()
+                        else:
+                            getattr(kernel.agents[int(rest[0], 16)], cmd)()
                     
                     case "msg":
                         if len(rest) == 0:
@@ -355,6 +374,10 @@ class User(Agent):
                             print("Usage: /poke <id>")
                         else:
                             kernel.agents[int(rest[0], 16)].poke()
+                    
+                    case "subs":
+                        for chan, subs in kernel.subs.items():
+                            print(chan, ":", ' / '.join(sub.name for sub in subs))
                     
                     case _:
                         print("Unknown command", cmd)

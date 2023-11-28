@@ -7,7 +7,7 @@ import inspect
 
 from typedef import Optional, defaultdict, dataclass, ABC, abstractmethod, Any, json_value, AsyncIterator
 from config import DUMB_MODEL, MODEL
-from util import logger, read_file, typename
+from util import logger, read_file, typename, normalize_chan
 from connector import AssistantId, connect, Connection
 from db import AgentRow, Database, MessageRow
 
@@ -94,6 +94,8 @@ class Agent(ABC):
     msg: asyncio.Queue[Optional[Message]]
     '''Pending messages to be processed.'''
     
+    pause_signal: asyncio.Event
+    
     def __init__(self,
         id: AgentRow.primary_key,
         name: Optional[str]=None,
@@ -109,8 +111,23 @@ class Agent(ABC):
         self.config = config
         
         self.msgq = asyncio.Queue()
+        self.pause_signal = asyncio.Event()
+        self.resume()
+    
+    def until_unpaused(self):
+        '''Wait until the agent is unpaused, if it's paused.'''
+        return self.pause_signal.wait()
+    
+    def pause(self):
+        '''Pause the agent.'''
+        self.pause_signal.clear()
+    
+    def resume(self):
+        '''Unpause the agent.'''
+        self.pause_signal.set()
     
     def idchan(self):
+        '''Get the channel for the agent's id.'''
         return f"@{self.id:04x}"
     
     def qualname(self) -> str:
@@ -123,18 +140,17 @@ class Agent(ABC):
         
     def push(self, msg: Message):
         '''Push a message to the agent.'''
+        logger.debug(f"Push received for {self.name}")
         self.msgq.put_nowait(msg)
     
     async def pull(self) -> AsyncIterator[Message]:
         '''Pull all pending messages from the message queue.'''
         
-        msg = await self.msgq.get()
-        if msg is not None:
-            yield await self.msgq.get()
+        if msg := await self.msgq.get():
+            yield msg
         
         while not self.msgq.empty():
-            msg = self.msgq.get_nowait()
-            if msg is not None:
+            if msg := self.msgq.get_nowait():
                 yield msg
     
     async def init(self, kernel: "Kernel", state: object):
@@ -191,10 +207,9 @@ class Kernel:
         self.tools = tools
         self.pause_signal = asyncio.Event()
     
-    async def until_unpaused(self):
+    def until_unpaused(self):
         '''Wait until the kernel is unpaused, if it's paused.'''
-        if self.pause_signal.is_set():
-            await self.pause_signal.wait()
+        return self.pause_signal.wait()
         
     def pause(self):
         '''Pause all agents.'''
@@ -331,13 +346,15 @@ class Kernel:
     def push(self, chan: str, row: MessageRow):
         '''Push a message to a channel. (One db message -> many pushes)'''
         
+        chan = normalize_chan(chan)
+        
         msg = Message(
             row.rowid, self.agents[row.agent_id],
             chan, row.content, row.created_at
         )
         
         if chan == "*":
-            # Broadcast
+            # Broadcast to all agentsz
             subscribers = self.agents.values()
         else:
             subscribers = self.subs.get(chan)
@@ -346,7 +363,6 @@ class Kernel:
         
         broadcast = self.subs.get("*") or set()
         
-        logger.debug("publish(): Push")
         pushes: list[tuple[str, int, int]] = []
         for target in subscribers:
             # Don't double-push to broadcast subscribers
@@ -371,17 +387,9 @@ class Kernel:
         Returns whether or not the channel has subscribers.
         '''
         
-        if chan == "@":
-            raise NotImplemented("Id channel with empty id")
+        chan = normalize_chan(chan)
         
-        if chan is not None:
-            chan = chan.lower()
-            # Logical id without 0 padding
-            if chan.startswith("@"):
-                chan = f"@{int(chan[1:], 16)}"
-        
-        logger.info(f"publish({agent.qualname()!r}, {chan!r}, {content!r})")
-        logger.debug("publish(): Creating message")
+        logger.info(f"publish({agent.qualname()!r}, {chan!r})")
         
         created_at = int(time.time())
         row = self.db.message("user", agent.id, content, created_at)

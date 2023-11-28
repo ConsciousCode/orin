@@ -1,11 +1,12 @@
 from functools import wraps
-from typing import TYPE_CHECKING, Awaitable, Callable, Iterator, Optional, overload, reveal_type
 
 import logging
 import os
 from prompt_toolkit import print_formatted_text
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.formatted_text import FormattedText
+
+from typedef import TYPE_CHECKING, Awaitable, Callable, Iterator, Optional, overload, reveal_type, overload
 
 class ColorLogHandler(logging.Handler):
     def __init__(self):
@@ -48,3 +49,23 @@ def read_file(filename):
 def typename(value):
     '''Return the type name of the value.'''
     return type(value).__name__
+
+@overload
+def normalize_chan(chan: None) -> None: ...
+@overload
+def normalize_chan(chan: str) -> str: ...
+
+def normalize_chan(chan: Optional[str]):
+    '''Normalize a channel name.'''
+    
+    if chan is None:
+        return
+    
+    if chan == "@":
+        raise NotImplemented("Id channel with empty id")
+    
+    chan = chan.lower()
+    # Logical id without 0 padding
+    if chan.startswith("@"):
+        chan = f"@{int(chan[1:], 16)}"
+    return chan
