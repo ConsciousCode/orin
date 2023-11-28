@@ -4,10 +4,9 @@ import time
 import sqlite3
 import dill
 
-from connector import RunId
-from util import read_file
-from connector import AssistantId
-from typedef import json_value, dataclass, dataclasses, Iterable, Iterator, Literal, Optional
+from .connector import RunId, AssistantId
+from .util import read_file
+from .typedef import json_value, dataclass, dataclasses, Iterable, Iterator, Literal, Optional
 
 VERSION = 0
 '''Version counter for database consistency.'''

@@ -5,11 +5,11 @@ import sqlite3
 from prompt_toolkit.patch_stdout import patch_stdout
 import inspect
 
-from typedef import Optional, defaultdict, dataclass, ABC, abstractmethod, Any, json_value, AsyncIterator
-from config import DUMB_MODEL, MODEL
-from util import logger, read_file, typename, normalize_chan
-from connector import AssistantId, connect, Connection
-from db import AgentRow, Database, MessageRow
+from .typedef import Optional, defaultdict, dataclass, ABC, abstractmethod, Any, json_value, AsyncIterator
+from .config import DUMB_MODEL, MODEL
+from .util import logger, read_file, typename, normalize_chan, Registrant
+from .connector import AssistantId, connect, Connection
+from .db import AgentRow, Database, MessageRow
 
 class Tool:
     kernel: 'Kernel'
@@ -66,15 +66,8 @@ class Message:
         
         return f"[{ts}]\t{self.src.qualname()}\t{channel}\t{content}"
 
-class Agent(ABC):
+class Agent(Registrant):
     '''Abstract agent participating in the consortium.'''
-    
-    registry: dict[str, type['Agent']] = {}
-    
-    @classmethod
-    def register(cls, agent):
-        cls.registry[agent.__name__] = agent
-        return agent
     
     id: AgentRow.primary_key
     '''Id of the agent in the database.'''

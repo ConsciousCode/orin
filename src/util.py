@@ -6,7 +6,7 @@ from prompt_toolkit import print_formatted_text
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.formatted_text import FormattedText
 
-from typedef import TYPE_CHECKING, Awaitable, Callable, Iterator, Optional, overload, reveal_type, overload
+from .typedef import TYPE_CHECKING, Awaitable, Callable, Iterator, Optional, overload, reveal_type, overload
 
 class ColorLogHandler(logging.Handler):
     def __init__(self):
@@ -69,3 +69,20 @@ def normalize_chan(chan: Optional[str]):
     if chan.startswith("@"):
         chan = f"@{int(chan[1:], 16)}"
     return chan
+
+class Registry(type):
+    '''Metaclass for registering subclasses.'''
+    
+    def __init__(cls, name, bases, attrs):
+        super().__init__(name, bases, attrs)
+        # Don't register resource base classes
+        if name != "Resource":
+            cls.registry = {}
+
+class Registrant(metaclass=Registry):
+    '''Self-registering resource.'''
+    
+    def __init_subclass__(cls):
+        # Only register subclasses of Resource subclasses
+        if Registrant not in cls.__bases__:
+            cls.registry[cls.__name__.lower()] = cls

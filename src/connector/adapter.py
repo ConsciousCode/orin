@@ -1,68 +1,13 @@
-'''
-Logic for connecting to LLM providers.
-'''
-
-import asyncio
-from functools import cached_property
-import openai as libopenai
-# Use openai internal NotGiven so we can pass it
-from openai._types import NotGiven, NOT_GIVEN
-import httpx
-import json
-from contextlib import asynccontextmanager
-
-from typedef import IO, Any, AsyncGenerator, AsyncIterator, Mapping, Optional, Literal, TypeGuard, get_args, PathLike, dataclass, field, ABC, abstractmethod
-
-class APIError(RuntimeError): pass
-class ExpiredError(RuntimeError): pass
-
-# Nominal type aliases
-type APIResourceId = str
-
-type AssistantId = APIResourceId
-type ThreadId = APIResourceId
-type MessageId = APIResourceId
-type RunId = APIResourceId
-type StepId = APIResourceId
-type FileId = APIResourceId
-
-def is_AssistantId(x: str) -> TypeGuard[AssistantId]:
-    return x.startswith("asst_")
-
-def is_ThreadId(x: str) -> TypeGuard[ThreadId]:
-    return x.startswith("thread_")
-
-def is_MessageId(x: str) -> TypeGuard[FileId]:
-    return x.startswith("msg_")
-
-def is_RunId(x: str) -> TypeGuard[RunId]:
-    return x.startswith("run_")
-
-def is_StepId(x: str) -> TypeGuard[StepId]:
-    return x.startswith("step_")
-
-def is_FileId(x: str) -> TypeGuard[FileId]:
-    return x.startswith("file_")
-
-def is_APIResourceId(check, x: str):
-    return {
-        AssistantId: is_AssistantId,
-        ThreadId: is_ThreadId,
-        MessageId: is_MessageId,
-        RunId: is_RunId,
-        StepId: is_StepId,
-        FileId: is_FileId
-    }[check](x)
+from .base import Connector
+from ..typedef import dataclass, field, Optional, Literal, AsyncGenerator, AsyncIterator, ABC
 
 @dataclass
-class ActionRequired:
-    '''Function call/action is required.'''
-    function: str
-    arguments: str
+class Endpoint(ABC):
+    conn: Connector
 
 @dataclass
-class APIResource[T: APIResourceId](ABC):
-    openai: libopenai.AsyncClient
+class APIResource(Endpoint):
+    conn: Connector
     id: T
     
     def __post_init__(self):
@@ -73,18 +18,6 @@ class APIResource[T: APIResourceId](ABC):
     @abstractmethod
     async def retrieve(self):
         '''Retrieve the raw API resource.'''
-
-@dataclass
-class ImageContent:
-    '''Image file content of a step.'''
-    file_id: FileId
-
-@dataclass
-class TextContent:
-    '''Text content of a step.'''
-    text: str
-
-type Content = ImageContent|TextContent
 
 @dataclass
 class Message:
@@ -142,7 +75,7 @@ class RunHandle(APIResource[RunId]):
     thread_id: ThreadId
     
     @dataclass
-    class StepEndpoint:
+    class StepEndpoint(Endpoint):
         run: 'RunHandle'
         
         def __call__(self, step_id: StepId):
@@ -439,15 +372,15 @@ class FileHandle(APIResource[FileId]):
         '''Delete file from OpenAI account.'''
         await self.openai.files.delete(self.id)
 
-class Connection:
+class Adapter:
     '''A realized connection to the LLM provider.'''
     
     @dataclass
     class AssistantEndpoint:
-        openai: libopenai.AsyncClient
+        conn: Connection
         
         def __call__(self, assistant_id: AssistantId):
-            return AssistantHandle(self.openai, assistant_id)
+            return AssistantHandle(self.conn, assistant_id)
         
         async def create(self,
             model: str,
@@ -457,7 +390,7 @@ class Connection:
             tools: list,
             file_ids: list[FileId]|NotGiven=NOT_GIVEN
         ):
-            return await self.openai.beta.assistants.create(
+            return await self.conn.beta.assistants.create(
                 model=model,
                 name=name,
                 description=description,
@@ -472,7 +405,7 @@ class Connection:
     
     @dataclass
     class FileEndpoint:
-        openai: libopenai.AsyncClient
+        openai: Connection
         
         def __call__(self, file_id: FileId):
             return FileHandle(self.openai, file_id)
@@ -533,11 +466,3 @@ class Connection:
         )
         
         return res.choices[0].message.content
-
-@asynccontextmanager
-async def connect(api_key: str):
-    '''Connect to the openai provider.'''
-    
-    async with httpx.AsyncClient() as http:
-        async with libopenai.AsyncClient(api_key=api_key, http_client=http) as client:
-            yield Connection(client, api_key)

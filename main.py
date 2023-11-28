@@ -1,11 +1,11 @@
 import asyncio
 import sys
 
-from system import start
-from tool import Create, Destroy, Subscribe, Unsubscribe, Publish, Python, Shell
+from src.system import start
+from src.tool import Create, Destroy, Subscribe, Unsubscribe, Publish, Python, Shell
 
 # Automatically links names to agent types
-import agent
+import src.agent
 
 DBPATH = "private/system.db"
 

@@ -2,9 +2,9 @@ import io
 from contextlib import redirect_stdout, redirect_stderr
 import traceback
 import subprocess
-from typing import override
 
-from system import Tool, Kernel, Agent
+from .typedef import override
+from .system import Tool, Kernel, Agent
 
 class Python(Tool):
     '''

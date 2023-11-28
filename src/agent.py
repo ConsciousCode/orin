@@ -7,14 +7,13 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import FormattedText
 
-from db import AgentRow
-from util import logger, typename, read_file
-from connector import ActionRequired, TextContent, ImageContent, AssistantId, ThreadId, RunId
-from typedef import override, Any, Optional
-from system import Message, Agent, Agent, Kernel
-from tool import Tool
+from .db import AgentRow
+from .util import logger, typename, read_file
+from .connector import ActionRequired, TextContent, ImageContent, AssistantId, ThreadId, RunId
+from .typedef import override, Any, Optional
+from .system import Message, Agent, Agent, Kernel
+from .tool import Tool
 
-@Agent.register
 class System(Agent):
     ring = 0
     name = "System"
@@ -30,7 +29,6 @@ class System(Agent):
     async def on_destroy(self, system: 'Kernel'):
         '''Callback for when the agent is destroyed. Allows alerting subscribers.'''
 
-@Agent.register
 class GPTAgent(Agent):
     '''Self-contained thread and assistant.'''
     
@@ -196,7 +194,6 @@ class GPTAgent(Agent):
     async def on_destroy(self, system: Kernel):
         await system.openai.thread(self.thread_id).delete()
 
-@Agent.register
 class Supervisor(GPTAgent):
     '''Supervising agent of the system.'''
     
@@ -244,7 +241,6 @@ def print_sql(cursor: sqlite3.Cursor, rows: list[sqlite3.Row]):
     if len(rows) > 0:
         print('\n', len(rows), "rows in set")
 
-@Agent.register
 class User(Agent):
     '''User proxy agent.'''
     
