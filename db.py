@@ -2,9 +2,10 @@ from contextlib import contextmanager
 import json
 import time
 import sqlite3
+import dill
 
+from connector import RunId
 from util import read_file
-
 from connector import AssistantId
 from typedef import json_value, dataclass, dataclasses, Iterable, Iterator, Literal, Optional
 
@@ -67,6 +68,15 @@ class PushRow(Row):
     channel: str
     agent_id: AgentRow.primary_key
     message_id: MessageRow.primary_key
+
+@dataclass
+class StateRow(Row):
+    type primary_key = int
+    rowid: primary_key
+    
+    created_at: int
+    agent_id: AgentRow.primary_key
+    data: bytes
 
 class Database:
     '''Holds logic for database persistence.'''
@@ -159,6 +169,12 @@ class Database:
                 INSERT OR IGNORE INTO push (channel, agent_id, message_id) VALUES (?, ?, ?)
             ''', rows)
     
+    def add_state(self, agent_id: AgentRow.primary_key, env: object):
+        with self.transaction() as cursor:
+            cursor.execute('''
+                INSERT INTO state (created_at, agent_id, data) VALUES (?, ?, ?)
+            ''', (int(time.time()), agent_id, dill.dumps(env),))
+    
     def message(self,
         role: Role,
         agent: AgentRow.primary_key,
@@ -193,3 +209,13 @@ class Database:
         return self.cast_execute(SubscriptionRow,
             "SELECT * FROM subscription"
         )
+    
+    def load_state(self, agent_id: AgentRow.primary_key) -> Optional[object]:
+        res = self.sql.execute(
+            "SELECT * FROM state WHERE agent_id=? ORDER BY rowid DESC LIMIT 1",
+            (agent_id,)
+        ).fetchall()
+        if res:
+            if data := res[0]['data']:
+                return dill.loads(data)
+        return None

@@ -2,7 +2,7 @@ import asyncio
 import sys
 
 from system import start
-from tool import Create, Destroy, Subscribe, Unsubscribe, Publish
+from tool import Create, Destroy, Subscribe, Unsubscribe, Publish, Python, Shell
 
 # Automatically links names to agent types
 import agent
@@ -13,7 +13,7 @@ async def main(argv):
     try:
         await start(DBPATH, {
             tool.__name__.lower(): tool
-            for tool in (Create, Destroy, Subscribe, Unsubscribe, Publish)
+            for tool in (Create, Destroy, Subscribe, Unsubscribe, Publish, Python, Shell)
         })
     
     finally:

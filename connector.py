@@ -2,21 +2,16 @@
 Logic for connecting to LLM providers.
 '''
 
-from abc import ABC, abstractmethod
 import asyncio
-from dataclasses import dataclass, field
 from functools import cached_property
-from os import PathLike
-import typing
 import openai as libopenai
 # Use openai internal NotGiven so we can pass it
 from openai._types import NotGiven, NOT_GIVEN
 import httpx
 import json
-from typing import IO, Any, AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, Optional, Literal, TypeGuard
 from contextlib import asynccontextmanager
 
-from tool import Tool
+from typedef import IO, Any, AsyncGenerator, AsyncIterator, Mapping, Optional, Literal, TypeGuard, get_args, PathLike, dataclass, field, ABC, abstractmethod
 
 class APIError(RuntimeError): pass
 class ExpiredError(RuntimeError): pass
@@ -71,7 +66,7 @@ class APIResource[T: APIResourceId](ABC):
     id: T
     
     def __post_init__(self):
-        T = typing.get_args(type(self).__orig_bases__[0])[0] # type: ignore
+        T = get_args(type(self).__orig_bases__[0])[0] # type: ignore
         if not is_APIResourceId(T, self.id):
             raise TypeError(f"API resource id mismatch: got {self.id} for {T.__name__}")
     
@@ -176,10 +171,13 @@ class RunHandle(APIResource[RunId]):
     async def __aenter__(self):
         return aiter(self)
     
-    async def __aexit__(self, *exc):
+    async def __aexit__(self, exc_type, exc_value, traceback):
         res = await self.retrieve()
         if res.status in {"in_progress", "queued"}:
             await self.cancel()
+        
+        if issubclass(exc_type, StopAsyncIteration):
+            return True
     
     async def retrieve(self):
         return await self.openai.beta.threads.runs.retrieve(
@@ -403,12 +401,9 @@ class AssistantHandle(APIResource[AssistantId]):
         file_ids: list[str]|NotGiven=NOT_GIVEN,
         instructions: Optional[str]|NotGiven=NOT_GIVEN,
         model: str|NotGiven=NOT_GIVEN,
-        tools: list[Tool]|NotGiven=NOT_GIVEN
+        tools: list[dict]|NotGiven=NOT_GIVEN
     ):
         '''Update assistant configuration.'''
-        
-        if not isinstance(tools, NotGiven):
-            tools = [tool.to_schema() for tool in tools] # type: ignore
         
         return await self.openai.beta.assistants.update(
             assistant_id=self.id,

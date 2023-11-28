@@ -10,7 +10,7 @@ from prompt_toolkit.formatted_text import FormattedText
 class ColorLogHandler(logging.Handler):
     def __init__(self):
         super().__init__()
-        fmt ='%(levelname)s [%(filename)s:%(lineno)d] %(message)s'
+        fmt ='[%(levelname)s] [%(filename)s:%(lineno)d] %(message)s'
         self.formatter = logging.Formatter(fmt)
 
     def emit(self, record):

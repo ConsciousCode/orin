@@ -8,8 +8,8 @@ from prompt_toolkit.formatted_text import FormattedText
 
 from db import AgentRow
 from util import logger, typename, read_file
-from connector import ActionRequired, TextContent, ImageContent, AssistantId, ThreadId
-from typedef import override, Any
+from connector import ActionRequired, TextContent, ImageContent, AssistantId, ThreadId, RunId
+from typedef import override, Any, Optional
 from system import Message, Agent, Agent, Kernel
 from tool import Tool
 
@@ -23,21 +23,24 @@ class System(Agent):
     async def run(self, system: 'Kernel'):
         while True:
             async for msg in self.pull():
-                # TODO
-                pass        
+                print("SYSTEM", msg)
     
     @override
     async def on_destroy(self, system: 'Kernel'):
         '''Callback for when the agent is destroyed. Allows alerting subscribers.'''
 
+@Agent.register
 class GPTAgent(Agent):
     '''Self-contained thread and assistant.'''
     
-    assistant: AssistantId
+    assistant_id: AssistantId
     '''Openai API assistant.'''
     
-    thread: ThreadId
+    thread_id: ThreadId
     '''Openai API thread.'''
+    
+    run_id: Optional[RunId]
+    '''Openai API run.'''
     
     tools: list[str]|dict[str, Tool]
     '''Instantiated tools available to the agent.'''
@@ -53,56 +56,101 @@ class GPTAgent(Agent):
             config = {}
         super().__init__(id, name, description, ring, config)
         
-        self.assistant = config.get("assistant") or self.assistant
-        self.thread = config.get('thread') or getattr(self, "thread", None) # type: ignore
+        self.assistant_id = config.get("assistant") or self.assistant_id
+        self.thread_id = config.get('thread') or getattr(self, "thread", None) # type: ignore
+        self.run_id = None
         self.tools = config.get('tools') or self.tools
+    
+    @override
+    def state(self):
+        assert isinstance(self.tools, dict)
+        return {
+            "tools": {
+                name: tool.state()
+                for name, tool in self.tools.items()
+            }
+        }
+    
+    @override
+    async def init(self, kernel: Kernel, state: dict):
+        # Initialize tools
+        self.tools = {
+            tool: kernel.tools[tool](kernel, self)
+            for tool in self.tools
+        }
+        last = None
+        async for run in kernel.openai.thread(self.thread_id).run.iter():
+            last = run
+        
+        if last and last.completed_at is None:
+            self.run_id = last.id
+            logger.info(f"Resuming {self.run_id}")
     
     @override
     async def run(self, kernel: Kernel):
         '''Run the agent thread in an infinite loop.'''
         
+        assert isinstance(self.tools, dict)
+        
         # Initialize
-        assistant = kernel.openai.assistant(self.assistant)
-        if self.thread is None:
+        assistant = kernel.openai.assistant(self.assistant_id)
+        if self.thread_id is None:
             # Create a new thread
             thread_id = (await kernel.openai.thread.create()).id
-            self.thread = thread_id
+            self.thread_id = thread_id
             kernel.update_config(self, {
-                "thread": self.thread
+                "thread": self.thread_id
             })
-        thread = kernel.openai.thread(self.thread)
-        
-        if isinstance(self.tools, list):
-            self.tools = {
-                tool: kernel.tools[tool](kernel, self)
-                for tool in self.tools
-            }
+        thread = kernel.openai.thread(self.thread_id)
         
         while True:
+            await kernel.until_unpaused()
+            
+            # Consume all pushed messages, adding to the thread
             last = None
             async for msg in self.pull():
                 last = await thread.message.create(str(msg))
+            # last is now the last message in the thread
             assert last is not None
             
-            async with await thread.run.create(assistant.id) as run:
-                async for step in run:
+            # Support recovering an existing run
+            if self.run_id is None:
+                runit = await thread.run.create(assistant.id)
+                self.run_id = runit.id
+                kernel.add_state(self)
+            else:
+                runit = thread.run(self.run_id)
+            
+            async with runit as run:
+                step = await anext(run)
+                # Should really be `while True` but then code is marked unreachable
+                while step is not None:
                     match step:
                         case ActionRequired(func, ps):
                             if func not in self.tools:
                                 content = f"ERROR: {func!r} is not an available tool (try one of: {list(self.tools.keys())})"
                             else:
                                 try:
-                                    print("Function call:", func, ps)
+                                    logger.info(f"Function call {func} {ps}")
                                     args = await kernel.parse_json(ps)
-                                    content = repr(self.tools[func](**args))
-                                except Exception as e:
+                                    content = repr(await self.tools[func](**args))
+                                except KeyboardInterrupt:
+                                    raise
+                                except BaseException as e:
                                     content = f"{typename(e)}: {e.args[0]}"
                             
-                            print("Return:", content)
-                            run.asend(content)
+                            logger.info(f"Return: {func} {content}")
+                            step = await run.asend(content)
                         
                         case _:
                             raise TypeError(f"Unknown step: {typename(step)}")
+            
+            self.run_id = None
+            
+            # TODO: Edge case, if agent swarm manager is stopped here then the
+            #  unnamed channel won't publish to subscribers. To fix, you would
+            #  need to keep a journal of API message IDs processed and recover
+            #  that journal on init.
             
             # Now retrieve the results
             async for step in thread.message.list(order='asc', after=last.id):
@@ -120,7 +168,7 @@ class GPTAgent(Agent):
     
     @override
     async def on_destroy(self, system: Kernel):
-        await system.openai.thread(self.thread).delete()
+        await system.openai.thread(self.thread_id).delete()
 
 @Agent.register
 class Supervisor(GPTAgent):
@@ -130,10 +178,21 @@ class Supervisor(GPTAgent):
     name = "Supervisor"
     description = str(__doc__)
     instructions = read_file("supervisor.md")
-    assistant = "asst_6SnQRYaBJOptljPpvJTvOd5o"
-    tools = ["subscribe", "unsubscribe", "publish"]
+    assistant_id = "asst_6SnQRYaBJOptljPpvJTvOd5o"
+    tools = ["subscribe", "unsubscribe", "publish", "create", "destroy", 'python', 'shell']
+    
+    @override
+    async def init(self, kernel: Kernel, state: dict):
+        await super().init(kernel, state)
+        assert isinstance(self.tools, dict)
+        
+        python = state.get("python")
+        if python is not None:
+            self.tools['python'].load_state(python)
 
 def print_sql(cursor: sqlite3.Cursor, rows: list[sqlite3.Row]):
+    '''Print the results of a SQL query.'''
+    
     if cursor.description is not None:
         # Fetch column headers
         headers = [desc[0] for desc in cursor.description]
@@ -165,8 +224,6 @@ class User(Agent):
     description = str(__doc__)
     
     def sql_command(self, kernel, cmd, code):
-        assert kernel.db is not None
-        
         try:
             match cmd:
                 case "sql":
@@ -204,8 +261,12 @@ class User(Agent):
                     thread = kernel.openai.thread(thread_id)
                     match (sub, *rest):
                         case ['list']:
+                            ls = []
                             async for run in thread.run.iter():
-                                print(run)
+                                ls.append(run.id)
+                            
+                            for run in reversed(ls):
+                                print("*", run.id)
                         
                         case ['get', str(run)]:
                             print(await thread.run(run).retrieve())
@@ -224,13 +285,16 @@ class User(Agent):
     
     @override
     def push(self, msg: Message):
-        print(msg)
+        print(msg.printable())
     
     async def run(self, kernel: Kernel):
         '''User input agent.'''
         
         tty = PromptSession()
         kernel.subscribe(self, "*")
+        
+        # NOTE: User agent does not respect kernel pausing, otherwise
+        #  it would be locked forever.
         
         while True:
             logger.debug("User(): Loop")
@@ -248,13 +312,13 @@ class User(Agent):
                 continue
             
             if user.startswith("/"):
-                assert kernel.db is not None
-                assert kernel.openai is not None
-                
                 cmd, *rest = user[1:].split(' ', 1)
                 match cmd:
+                    # Comment
+                    case "#":
+                        pass
                     case "help":
-                        print("help quit sql select thread")
+                        print("# help quit sql select thread run{list, get, cancel} pause resume/unpause")
                     
                     case "quit": kernel.exit()
                     case "sql"|"select":
@@ -262,6 +326,11 @@ class User(Agent):
                     
                     case "thread"|"run":
                         await self.openai_command(kernel, cmd, rest[0])
+                    
+                    case "pause":
+                        kernel.pause()
+                    case "resume"|'unpause':
+                        kernel.resume()
                     
                     case _:
                         print("Unknown command", cmd)

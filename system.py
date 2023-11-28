@@ -2,15 +2,48 @@ import asyncio
 import json
 import time
 import sqlite3
-from typing import Any
 from prompt_toolkit.patch_stdout import patch_stdout
+import inspect
 
-from typedef import Optional, defaultdict, dataclass, ABC, abstractmethod
+from typedef import Optional, defaultdict, dataclass, ABC, abstractmethod, Any
 from config import DUMB_MODEL, MODEL
-from tool import Tool
-from util import logger, read_file
+from util import logger, read_file, typename
 from connector import AssistantId, connect, Connection
 from db import AgentRow, Database, MessageRow
+
+class Tool:
+    kernel: 'Kernel'
+    agent: 'Agent'
+    parameters: dict
+    
+    def __init__(self, kernel: 'Kernel', agent: 'Agent'):
+        self.kernel = kernel
+        self.agent = agent
+    
+    def state(self) -> object:
+        '''Build the state object for the tool.'''
+        return None
+    
+    async def __call__(self, **kwargs):
+        ...
+    
+    @classmethod
+    def to_schema(cls):
+        return {
+            "type": "function",
+            "function": {
+                "name": cls.__name__.lower(),
+                "description": inspect.getdoc(cls),
+                "parameters": {
+                    "type": "object",
+                    "properties": cls.parameters,
+                    "required": list(cls.parameters.keys())
+                }
+            }
+        }
+    
+    def load_state(self, state: object):
+        pass
 
 @dataclass
 class Message:
@@ -20,12 +53,18 @@ class Message:
     content: str
     created_at: float
     
+    def printable(self):
+        ts = time.strftime("%H:%M:%S", time.localtime(self.created_at))
+        channel = json.dumps(self.channel)
+        
+        return f"[{ts}] {self.src.qualname()}\t{channel}\n{self.content}"
+    
     def __str__(self):
         ts = time.strftime("%H:%M:%S", time.localtime(self.created_at))
         channel = json.dumps(self.channel)
         content = json.dumps(self.content)
         
-        return f"[{ts}]\t{self.src.qualname()}:\t{channel}\t{content}"
+        return f"[{ts}]\t{self.src.qualname()}\t{channel}\t{content}"
 
 class Agent(ABC):
     '''Abstract agent participating in the consortium.'''
@@ -35,6 +74,7 @@ class Agent(ABC):
     @classmethod
     def register(cls, agent):
         cls.registry[agent.__name__] = agent
+        return agent
     
     id: AgentRow.primary_key
     '''Id of the agent in the database.'''
@@ -71,7 +111,7 @@ class Agent(ABC):
         self.msgq = asyncio.Queue()
     
     def idchan(self):
-        return f"@{self.id}"
+        return f"@{self.id:04x}"
     
     def qualname(self) -> str:
         '''Return the fully qualified name of the agent, including any ids.'''
@@ -89,6 +129,16 @@ class Agent(ABC):
         
         while not self.msgq.empty():
             yield self.msgq.get_nowait()
+    
+    async def init(self, kernel: "Kernel", state: object):
+        '''Initialize the agent.'''
+        
+        if state is not None:
+            raise NotImplementedError(f"{typename(self)} agent load_state got non-None state")
+    
+    def state(self) -> object:
+        '''Build the state object for the agent.'''
+        return None
     
     @abstractmethod
     async def run(self, kernel: 'Kernel'):
@@ -116,14 +166,13 @@ class Kernel:
     subs: defaultdict[str, set[Agent]]
     '''Subscription map.'''
     
-    cache: dict[type[Agent], Any]
-    '''Cache for agents to use.'''
-    
     tools: dict[str, type[Tool]]
     '''Available tools.'''
     
     agent: Agent
     '''Agent representing the kernel.'''
+    
+    pause_signal: asyncio.Event
     
     def __init__(self, taskgroup: asyncio.TaskGroup, db: Database, openai: Connection, tools: dict[str, type[Tool]]):
         self.taskgroup = taskgroup
@@ -131,9 +180,27 @@ class Kernel:
         self.openai = openai
         self.archetypes = {}
         self.agents = {}
-        self.cache = {}
         self.subs = defaultdict(set)
         self.tools = tools
+        self.pause_signal = asyncio.Event()
+    
+    async def until_unpaused(self):
+        '''Wait until the kernel is unpaused, if it's paused.'''
+        if self.pause_signal.is_set():
+            await self.pause_signal.wait()
+        
+    def pause(self):
+        '''Pause all agents.'''
+        self.pause_signal.clear()
+    
+    def resume(self):
+        '''Unpause all agents.'''
+        self.pause_signal.set()
+    
+    def add_state(self, agent: Agent):
+        '''Add the agent's state to the database.'''
+        
+        self.db.add_state(agent.id, agent.state())
     
     def agent_type(self, name):
         '''Return an agent type given its name.'''
@@ -180,8 +247,7 @@ class Kernel:
         
         AgentType = self.agent_type(type)
         agent_id = self.db.create_agent(
-            type,
-            ring or AgentType.ring,
+            type, ring or AgentType.ring,
             name or AgentType.name,
             description or AgentType.description,
             config
@@ -191,19 +257,24 @@ class Kernel:
         self.taskgroup.create_task(agent.run(self))
         return agent
     
-    async def destroy(self, id):
+    async def destroy(self, id: AgentRow.primary_key):
         '''Destroy an agent.'''
         
         logger.info(f"destroy({id})")
         
-        assert self.db is not None
+        agent = self.agents.get(id)
+        if agent is None:
+            return False
         
         self.db.destroy_agent(id)
-        agent = self.agents.pop(id)
+        del self.agents[id]
         await agent.on_destroy(self)
         self.unsubscribe_all(agent.idchan())
         
-        if agent.name not in self.agents:
+        for ag in self.agents:
+            if ag == agent.name:
+                break
+        else:
             # No other agents have this name, delete it
             self.subs.pop(agent.name, None)
     
@@ -212,7 +283,6 @@ class Kernel:
         
         logger.info(f"subscribe({agent.qualname()!r}, {chan!r})")
         
-        assert self.db is not None
         self.db.subscribe(chan, agent.id)
         self.subs[chan].add(agent)
     
@@ -230,7 +300,6 @@ class Kernel:
         
         logger.info(f"unsubscribe({agent.qualname()!r}, {chan!r})")
         
-        assert self.db is not None
         self.db.unsubscribe(chan, agent.id)
         
         try:
@@ -319,6 +388,7 @@ class Kernel:
             agent = self.agent_type(row.type)(
                 row.rowid, row.name, row.description, row.ring, config
             )
+            await agent.init(self, self.db.load_state(agent.id))
             self.agents[agent.id] = agent
         
         if len(self.agents) == 0:
